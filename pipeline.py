@@ -8,7 +8,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import make_pipeline
 
 SEED = 42
@@ -26,20 +26,21 @@ TOPICS = {
 
 def _issue_data(seed: int = SEED):
     rng = random.Random(seed)
-    texts, hours = [], []
+    texts, hours, groups = [], [], []
     for topic, phrases in TOPICS.items():
         base = {"authentication": 5, "billing": 8, "api": 6, "database": 12, "export": 4, "notifications": 5, "permissions": 7, "search": 4}[topic]
-        for i in range(32):
-            phrase = rng.choice(phrases)
-            texts.append(f"{phrase}; build {i % 7}; environment {('linux', 'windows', 'cloud')[i % 3]}")
-            hours.append(max(0.5, base + 0.22 * len(phrase.split()) + rng.gauss(0, 1.8)))
-    return texts, np.asarray(hours)
+        for phrase_id, phrase in enumerate(phrases):
+            for i in range(32):
+                texts.append(f"{phrase}; build {i % 7}; environment {('linux', 'windows', 'cloud')[i % 3]}")
+                hours.append(max(0.5, base + 0.22 * len(phrase.split()) + rng.gauss(0, 1.8)))
+                groups.append(f"{topic}-{phrase_id}")
+    return texts, np.asarray(hours), groups
 
 
 def _pairs(seed: int = SEED):
     rng = random.Random(seed + 1)
     items = list(TOPICS.items())
-    pairs, labels = [], []
+    pairs, labels, groups = [], [], []
     for _ in range(480):
         if rng.random() < 0.5:
             _, phrases = rng.choice(items)
@@ -51,7 +52,8 @@ def _pairs(seed: int = SEED):
             label = 0
         pairs.append((a, b))
         labels.append(label)
-    return pairs, np.asarray(labels)
+        groups.append(" :: ".join(sorted((a, b))))
+    return pairs, np.asarray(labels), groups
 
 
 class IssuePairClassifier(ClassifierMixin, BaseEstimator):
@@ -91,8 +93,8 @@ def sample_input():
 
 
 def train_model(seed: int = SEED):
-    pairs, labels = _pairs(seed)
-    texts, hours = _issue_data(seed)
+    pairs, labels, _ = _pairs(seed)
+    texts, hours, _ = _issue_data(seed)
     duplicate = IssuePairClassifier().fit(pairs, labels)
     resolution = make_pipeline(TfidfVectorizer(ngram_range=(1, 2)), Ridge(alpha=2.0))
     resolution.fit(texts, hours)
@@ -108,12 +110,16 @@ def predict(model, payload):
 
 
 def evaluate(seed: int = SEED):
-    pairs, labels = _pairs(seed)
-    p_train, p_test, y_train, y_test = train_test_split(pairs, labels, test_size=0.25, random_state=seed, stratify=labels)
-    duplicate = IssuePairClassifier().fit(p_train, y_train)
-    dup_pred = duplicate.predict(p_test)
-    texts, hours = _issue_data(seed)
-    x_train, x_test, r_train, r_test = train_test_split(texts, hours, test_size=0.25, random_state=seed)
+    pairs, labels, pair_groups = _pairs(seed)
+    p_train, p_test = next(GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed).split(pairs, labels, pair_groups))
+    y_train, y_test = labels[p_train], labels[p_test]
+    duplicate = IssuePairClassifier().fit([pairs[i] for i in p_train], y_train)
+    dup_pred = duplicate.predict([pairs[i] for i in p_test])
+    texts, hours, issue_groups = _issue_data(seed)
+    x_train_idx, x_test_idx = next(GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed).split(texts, hours, issue_groups))
+    x_train = [texts[i] for i in x_train_idx]
+    x_test = [texts[i] for i in x_test_idx]
+    r_train, r_test = hours[x_train_idx], hours[x_test_idx]
     resolution = make_pipeline(TfidfVectorizer(ngram_range=(1, 2)), Ridge(alpha=2.0)).fit(x_train, r_train)
     pred = resolution.predict(x_test)
     return {
